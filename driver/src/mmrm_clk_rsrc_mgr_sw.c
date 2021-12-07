@@ -14,7 +14,7 @@
 #define Q16_INT(q) ((q) >> 16)
 #define Q16_FRAC(q) ((((q) & 0xFFFF) * 100) >> 16)
 #define CLK_RATE_STEP 1000000
-#define CLIENT_CB_TIMEOUT msecs_to_jiffies(100)
+#define NOTIFY_TIMEOUT 100000000
 
 static int mmrm_sw_update_freq(
 	struct mmrm_sw_clk_mgr_info *sinfo, struct mmrm_sw_clk_client_tbl_entry *tbl_entry)
@@ -460,7 +460,7 @@ err_invalid_level:
 
 static int mmrm_sw_calculate_total_current(
 	struct mmrm_sw_clk_mgr_info *sinfo,
-	u32 req_level, u32 *total_cur)
+	u32 req_level, u32 *total_cur, struct mmrm_sw_clk_client_tbl_entry *tbl_entry_new)
 {
 	int rc = 0;
 	struct mmrm_sw_clk_client_tbl_entry *tbl_entry;
@@ -475,14 +475,16 @@ static int mmrm_sw_calculate_total_current(
 	/* calculate sum of values (scaled by volt) */
 	for (c = 0; c < sinfo->tot_clk_clients; c++) {
 		tbl_entry = &sinfo->clk_client_tbl[c];
-		if (IS_ERR_OR_NULL(tbl_entry->clk) || !tbl_entry->clk_rate) {
+		if (IS_ERR_OR_NULL(tbl_entry->clk) || !tbl_entry->clk_rate
+			|| (tbl_entry == tbl_entry_new)) {
 			continue;
 		}
-		sum_cur += tbl_entry->current_ma[tbl_entry->vdd_level][req_level];
+		sum_cur += (tbl_entry->current_ma[tbl_entry->vdd_level][req_level]
+			* tbl_entry->num_hw_blocks);
 	}
 
 	*total_cur = sum_cur;
-	d_mpr_h("%s: total_cur(%d)\n", __func__, sum_cur);
+	d_mpr_h("%s: total_cur(%lu)\n", __func__, *total_cur);
 	return rc;
 
 err_invalid_level:
@@ -493,6 +495,7 @@ static int mmrm_sw_throttle_low_priority_client(
 	struct mmrm_sw_clk_mgr_info *sinfo, int *delta_cur)
 {
 	int rc = 0, i;
+	u64 start_ts = 0, end_ts = 0;
 	bool found_client_throttle = false;
 	struct mmrm_sw_clk_client_tbl_entry *tbl_entry_throttle_client;
 	struct mmrm_client_notifier_data notifier_data;
@@ -545,16 +548,25 @@ static int mmrm_sw_throttle_low_priority_client(
 		notifier_data.cb_data.val_chng.new_val =
 			tbl_entry_throttle_client->freq[clk_min_level];
 		notifier_data.pvt_data = tbl_entry_throttle_client->pvt_data;
+		start_ts = ktime_get_ns();
 
 		if (tbl_entry_throttle_client->notifier_cb_fn)
 			rc = tbl_entry_throttle_client->notifier_cb_fn(&notifier_data);
 
+		end_ts = ktime_get_ns();
+		d_mpr_h("%s: Client notifier cbk processing time %llu ns\n",
+			__func__, (end_ts - start_ts));
+
 		if (rc) {
 			d_mpr_e("%s: Client failed to send SUCCESS in callback(%d)\n",
-					__func__, tbl_entry_throttle_client->clk_src_id);
+				__func__, tbl_entry_throttle_client->clk_src_id);
 			rc = -EINVAL;
 			goto err_clk_set_fail;
 		}
+
+		if ((end_ts - start_ts) > NOTIFY_TIMEOUT)
+			d_mpr_e("%s:Client notifier cbk took %llu ns more than timeout %llu ns\n",
+				__func__, (end_ts - start_ts), NOTIFY_TIMEOUT);
 
 		if (tbl_entry_throttle_client->reserve == false) {
 			rc = clk_set_rate(tbl_entry_throttle_client->clk,
@@ -607,17 +619,18 @@ static void mmrm_sw_dump_enabled_client_info(struct mmrm_sw_clk_mgr_info *sinfo)
 	for (c = 0; c < sinfo->tot_clk_clients; c++) {
 		tbl_entry = &sinfo->clk_client_tbl[c];
 		if (tbl_entry->clk_rate) {
-			d_mpr_p("%s: csid(0x%x) clk_rate(%zu) vdd_level(%zu) cur_ma(%zu)\n",
+			d_mpr_e("%s: csid(0x%x) clk_rate(%zu) vdd_level(%zu) cur_ma(%zu) num_hw_blocks(%zu)\n",
 				__func__,
 				tbl_entry->clk_src_id,
 				tbl_entry->clk_rate,
 				tbl_entry->vdd_level,
 				tbl_entry->current_ma[tbl_entry->vdd_level]
-									[peak_data->aggreg_level]);
+					[peak_data->aggreg_level] * tbl_entry->num_hw_blocks,
+				tbl_entry->num_hw_blocks);
 		}
 	}
 	if (peak_data) {
-		d_mpr_p("%s: aggreg_val(%zu) aggreg_level(%zu)\n", __func__,
+		d_mpr_e("%s: aggreg_val(%zu) aggreg_level(%zu)\n", __func__,
 			peak_data->aggreg_val, peak_data->aggreg_level);
 	}
 }
@@ -627,6 +640,8 @@ static int mmrm_reinstate_throttled_client(struct mmrm_sw_clk_mgr_info *sinfo) {
 	struct mmrm_sw_throttled_clients_data *iter, *safe_iter = NULL;
 	struct mmrm_client_notifier_data notifier_data;
 	struct mmrm_sw_clk_client_tbl_entry *re_entry_throttle_client;
+	int rc =  0;
+	u64 start_ts = 0, end_ts = 0;
 
 	list_for_each_entry_safe(iter, safe_iter, &sinfo->throttled_clients, list) {
 		if (!IS_ERR_OR_NULL(iter) && peak_data->aggreg_val +
@@ -642,21 +657,36 @@ static int mmrm_reinstate_throttled_client(struct mmrm_sw_clk_mgr_info *sinfo) {
 				d_mpr_h("%s:found throttled client name(%s) clsid (0x%x)\n",
 					__func__, re_entry_throttle_client->name,
 					re_entry_throttle_client->clk_src_id);
-			notifier_data.cb_type = MMRM_CLIENT_RESOURCE_VALUE_CHANGE;
-			notifier_data.cb_data.val_chng.old_val =
-				re_entry_throttle_client->freq[MMRM_VDD_LEVEL_LOW_SVS];
+				notifier_data.cb_type = MMRM_CLIENT_RESOURCE_VALUE_CHANGE;
+				notifier_data.cb_data.val_chng.old_val =
+					re_entry_throttle_client->freq[MMRM_VDD_LEVEL_LOW_SVS];
 
-			notifier_data.cb_data.val_chng.new_val =
-				re_entry_throttle_client->freq[iter->prev_vdd_level];
+				notifier_data.cb_data.val_chng.new_val =
+					re_entry_throttle_client->freq[iter->prev_vdd_level];
 
-			notifier_data.pvt_data = re_entry_throttle_client->pvt_data;
+				notifier_data.pvt_data = re_entry_throttle_client->pvt_data;
+				start_ts = ktime_get_ns();
 
-			if (re_entry_throttle_client->notifier_cb_fn)
-				re_entry_throttle_client->notifier_cb_fn(&notifier_data);
+				if (re_entry_throttle_client->notifier_cb_fn) {
+					rc = re_entry_throttle_client->notifier_cb_fn
+								(&notifier_data);
+					end_ts = ktime_get_ns();
+					d_mpr_h("%s: Client notifier cbk processing time(%llu)ns\n",
+						__func__, end_ts - start_ts);
+
+					if (rc) {
+						d_mpr_e("%s: Client notifier callback failed(%d)\n",
+							__func__,
+							re_entry_throttle_client->clk_src_id);
+					}
+					if ((end_ts - start_ts) > NOTIFY_TIMEOUT)
+						d_mpr_e("%s: Client notifier took %llu ns\n",
+							__func__, (end_ts - start_ts));
+				}
+				list_del(&iter->list);
+				kfree(iter);
 			}
 		}
-		list_del(&iter->list);
-		kfree(iter);
 	}
 	return 0;
 }
@@ -671,7 +701,7 @@ static int mmrm_sw_check_peak_current(struct mmrm_sw_clk_mgr_info *sinfo,
 	u32 peak_cur = peak_data->aggreg_val;
 	u32 old_cur = 0, new_cur = 0;
 
-	int delta_cur;
+	int delta_cur = 0;
 
 	/* check the req level and adjust according to tbl entries */
 	rc = mmrm_sw_check_req_level(sinfo, tbl_entry->clk_src_id, req_level, &adj_level);
@@ -679,24 +709,38 @@ static int mmrm_sw_check_peak_current(struct mmrm_sw_clk_mgr_info *sinfo,
 		goto err_invalid_level;
 	}
 
+	/* calculate new cur val as per adj_val */
+	if (clk_val)
+		new_cur = tbl_entry->current_ma[req_level][adj_level] * num_hw_blocks;
+
+
+	/* calculate old cur */
+	if (tbl_entry->clk_rate) {
+		//old_cur = tbl_entry->current_ma[tbl_entry->vdd_level][adj_level];
+		old_cur = tbl_entry->current_ma[tbl_entry->vdd_level]
+			[peak_data->aggreg_level] * tbl_entry->num_hw_blocks;
+	}
+
+	/* 1. adj_level increase: recalculated peak_cur other clients + new_cur
+	 * 2. adj_level decrease: recalculated peak_cur other clients + new_cur
+	 * 3. clk_val increase: aggreg_val + (new_cur - old_cur)
+	 * 4. clk_val decrease: aggreg_val + (new_cur - old_cur)
+	 * 5. clk_val 0: aggreg_val - old_cur
+	 */
+
 	/* recalculate aggregated current with adj level */
 	if (adj_level != peak_data->aggreg_level) {
-		rc = mmrm_sw_calculate_total_current(sinfo, adj_level, &peak_cur);
+		rc = mmrm_sw_calculate_total_current(sinfo, adj_level, &peak_cur, tbl_entry);
 		if (rc) {
 			goto err_invalid_level;
 		}
+		peak_cur += new_cur;
+	} else {
+		delta_cur = (signed int)new_cur - old_cur;
 	}
 
-	/* calculate delta cur */
-	if (tbl_entry->clk_rate) {
-		old_cur = tbl_entry->current_ma[tbl_entry->vdd_level][adj_level];
-	}
-
-	if (clk_val) {
-		new_cur = tbl_entry->current_ma[req_level][adj_level] * num_hw_blocks;
-	}
-
-	delta_cur = (signed)new_cur - old_cur;
+	d_mpr_h("%s: csid (0x%x) peak_cur(%zu) new_cur(%zu) old_cur(%zu) delta_cur(%d)\n",
+		__func__, tbl_entry->clk_src_id, peak_cur, new_cur, old_cur, delta_cur);
 
 	/* negative value, update peak data */
 	if ((signed)peak_cur + delta_cur <= 0) {
@@ -726,6 +770,7 @@ static int mmrm_sw_check_peak_current(struct mmrm_sw_clk_mgr_info *sinfo,
 			goto err_peak_overshoot;
 		}
 	}
+
 	/* update peak data */
 	peak_data->aggreg_val = peak_cur + delta_cur;
 	peak_data->aggreg_level = adj_level;
@@ -740,21 +785,6 @@ exit_no_err:
 
 err_invalid_level:
 err_peak_overshoot:
-	return rc;
-}
-
-static bool mmrm_sw_is_valid_num_hw_block(struct mmrm_sw_clk_client_tbl_entry *tbl_entry,
-	struct mmrm_client_data *client_data)
-{
-	bool rc = false;
-	u32 num_hw_blocks = client_data->num_hw_blocks;
-
-	if (num_hw_blocks == 1) {
-		rc = true;
-	} else if  (tbl_entry->clk_src_id == 0x10025) { // CAM_CC_IFE_CSID_CLK_SRC
-		if (num_hw_blocks >= 1 && num_hw_blocks <= 3)
-			rc = true;
-	}
 	return rc;
 }
 
@@ -810,7 +840,8 @@ static int mmrm_sw_clk_client_setval(struct mmrm_clk_mgr *sw_clk_mgr,
 	 */
 	req_reserve = client_data->flags & MMRM_CLIENT_DATA_FLAG_RESERVE_ONLY;
 	if (tbl_entry->clk_rate == clk_val &&
-				tbl_entry->num_hw_blocks == client_data->num_hw_blocks) {
+		tbl_entry->num_hw_blocks == client_data->num_hw_blocks) {
+
 		d_mpr_h("%s: csid(0x%x) same as previous clk rate %llu\n",
 			__func__, tbl_entry->clk_src_id, clk_val);
 
@@ -839,14 +870,15 @@ static int mmrm_sw_clk_client_setval(struct mmrm_clk_mgr *sw_clk_mgr,
 			rc = -EINVAL;
 			goto err_invalid_clk_val;
 		}
+		if (!((client_data->num_hw_blocks >= 1) &&
+			   (client_data->num_hw_blocks <= tbl_entry->max_num_hw_blocks))) {
+			d_mpr_e("%s: csid(0x%x) num_hw_block:%d\n",
+				__func__, tbl_entry->clk_src_id, client_data->num_hw_blocks);
+			rc = -EINVAL;
+			goto err_invalid_client_data;
+		}
 	} else {
 		req_level = 0;
-	}
-	if (!mmrm_sw_is_valid_num_hw_block(tbl_entry, client_data)) {
-		d_mpr_e("%s: csid(0x%x) num_hw_block:%d\n",
-			__func__, tbl_entry->clk_src_id, client_data->num_hw_blocks);
-		rc = -EINVAL;
-		goto err_invalid_client_data;
 	}
 
 	mutex_lock(&sw_clk_mgr->lock);
@@ -956,12 +988,51 @@ err_invalid_client:
 	return rc;
 }
 
+static int mmrm_sw_clk_print_enabled_client_info(struct mmrm_clk_mgr *sw_clk_mgr,
+	char *buf,
+	int sz)
+{
+	u32 c, len;
+	u32 left_spaces = (u32)sz;
+	struct mmrm_sw_clk_mgr_info *sinfo = &(sw_clk_mgr->data.sw_info);
+	struct mmrm_sw_peak_current_data *peak_data = &sinfo->peak_cur_data;
+	struct mmrm_sw_clk_client_tbl_entry *tbl_entry = NULL;
+
+	len = scnprintf(buf, left_spaces, "  csid    clk_rate     vdd_level   cur_ma   num_hw_blocks\n");
+	left_spaces -= len;
+	buf += len;
+
+	if (sinfo != NULL && peak_data != NULL) {
+		for (c = 0; (c < sinfo->tot_clk_clients) && (left_spaces > 1); c++) {
+			tbl_entry = &sinfo->clk_client_tbl[c];
+			if ((tbl_entry != NULL) && (tbl_entry->clk_rate)) {
+				len = scnprintf(buf, left_spaces, "0x%x    %zu   %zu   %zu   %zu\n",
+					tbl_entry->clk_src_id,
+					tbl_entry->clk_rate,
+					tbl_entry->vdd_level,
+					tbl_entry->current_ma[tbl_entry->vdd_level]
+						[peak_data->aggreg_level] * tbl_entry->num_hw_blocks,
+					tbl_entry->num_hw_blocks);
+				left_spaces -= len;
+				buf += len;
+			}
+		}
+		if (left_spaces > 1) {
+			len = scnprintf(buf, left_spaces, "aggreg_val(%zu) aggreg_level(%zu)\n",
+				peak_data->aggreg_val, peak_data->aggreg_level);
+			left_spaces -= len;
+		}
+	}
+	return (sz - left_spaces);
+}
+
 static struct mmrm_clk_mgr_client_ops clk_client_swops = {
 	.clk_client_reg = mmrm_sw_clk_client_register,
 	.clk_client_dereg = mmrm_sw_clk_client_deregister,
 	.clk_client_setval = mmrm_sw_clk_client_setval,
 	.clk_client_setval_inrange = mmrm_sw_clk_client_setval_inrange,
 	.clk_client_getval = mmrm_sw_clk_client_getval,
+	.clk_print_enabled_client_info = mmrm_sw_clk_print_enabled_client_info,
 };
 
 static int mmrm_sw_prepare_table(struct mmrm_clk_platform_resources *cres,
@@ -983,12 +1054,14 @@ static int mmrm_sw_prepare_table(struct mmrm_clk_platform_resources *cres,
 			nom_tbl_entry->nom_dyn_pwr;
 		tbl_entry->leak_pwr[MMRM_VDD_LEVEL_NOM] =
 			nom_tbl_entry->nom_leak_pwr;
+		tbl_entry->max_num_hw_blocks = nom_tbl_entry->num_hw_block;
 
-		d_mpr_h("%s: updating csid(0x%x) dyn_pwr(%d) leak_pwr(%d)\n",
+		d_mpr_h("%s: updating csid(0x%x) dyn_pwr(%d) leak_pwr(%d) num(%d)\n",
 			__func__,
 			tbl_entry->clk_src_id,
 			tbl_entry->dyn_pwr[MMRM_VDD_LEVEL_NOM],
-			tbl_entry->leak_pwr[MMRM_VDD_LEVEL_NOM]);
+			tbl_entry->leak_pwr[MMRM_VDD_LEVEL_NOM],
+			tbl_entry->num_hw_blocks);
 	}
 
 	return rc;

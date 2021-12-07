@@ -51,6 +51,7 @@ struct mmrm_sw_clk_client_tbl_entry {
 	bool pass_through;
 	u32 min_level;
 	u32 max_level;
+	u32 max_num_hw_blocks;
 	u64 freq[MMRM_VDD_LEVEL_MAX];
 	u32 dyn_pwr[MMRM_VDD_LEVEL_MAX];
 	u32 leak_pwr[MMRM_VDD_LEVEL_MAX];
@@ -134,6 +135,8 @@ struct mmrm_clk_mgr_client_ops {
 		struct mmrm_client_res_value *val);
 	int (*clk_client_getval)(struct mmrm_clk_mgr *clk_mgr,
 		struct mmrm_client *client, struct mmrm_client_res_value *val);
+	int (*clk_print_enabled_client_info)(struct mmrm_clk_mgr *clk_mgr,
+		char *buf, int sz);
 };
 
 /* clk mgr operations */
@@ -159,6 +162,9 @@ int mmrm_clk_client_setval_inrange(struct mmrm_clk_mgr *clk_mgr,
 int mmrm_clk_client_getval(struct mmrm_clk_mgr *clk_mgr,
 	struct mmrm_client *client,
 	struct mmrm_client_res_value *val);
+int mmrm_clk_print_enabled_client_info(struct mmrm_clk_mgr *clk_mgr,
+	char *buf,
+	int sz);
 
 /* sw clk mgr specific */
 int mmrm_init_sw_clk_mgr(void *driver_data);
